@@ -1,0 +1,97 @@
+# 공개 저장소용 iOS 빌드 워크플로 — 원본은 scin-revive/scripts/ios-build/public/ 에 있다.
+# 공개 저장소의 로그·아티팩트는 누구나 볼 수 있으므로:
+#   - 소스는 payload/source.tar.gz.enc 로만 들어오고 러너 임시 디렉터리에서만 복호화한다.
+#   - 빌드 출력(컴파일 에러에 소스 줄이 찍힘)은 로그 대신 파일로 받고, 결과물과 함께 암호화해 올린다.
+#   - 소스가 남는 캐시(pub/빌드 디렉터리)는 쓰지 않는다(포크 PR 워크플로가 캐시를 복원할 수 있음).
+name: iOS
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# concurrency로 취소하지 않는다 — 릴리스 빌드가 다른 push에 밀려 취소되면 안 된다.
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 60
+
+    env:
+      SCIN_API_URL: https://api.scin.kr
+      SCIN_WEB_URL: https://scin.kr
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Decrypt source
+        env:
+          SOURCE_KEY: ${{ secrets.SOURCE_KEY }}
+        run: |
+          if [ -z "$SOURCE_KEY" ]; then
+            echo "::error::SOURCE_KEY secret is not set"
+            exit 1
+          fi
+          OPENSSL="$(brew --prefix openssl@3)/bin/openssl"
+          SRC_DIR="$RUNNER_TEMP/src" OUT_DIR="$RUNNER_TEMP/out"
+          printf 'SRC_DIR=%s\nOUT_DIR=%s\n' "$SRC_DIR" "$OUT_DIR" >> "$GITHUB_ENV"
+          mkdir -p "$SRC_DIR" "$OUT_DIR"
+          "$OPENSSL" enc -d -aes-256-cbc -pbkdf2 -iter 200000 -md sha256 \
+            -pass env:SOURCE_KEY -in payload/source.tar.gz.enc \
+            | tar -xz -C "$SRC_DIR"
+          # 버전(선택, 평문). 형식이 맞는 값만 받는다.
+          if [ -f payload/build.env ]; then
+            BUILD_NAME=$(sed -nE 's/^BUILD_NAME=([0-9]+\.[0-9]+\.[0-9]+)$/\1/p' payload/build.env)
+            BUILD_NUMBER=$(sed -nE 's/^BUILD_NUMBER=([0-9]+)$/\1/p' payload/build.env)
+            printf 'BUILD_NAME=%s\nBUILD_NUMBER=%s\n' "$BUILD_NAME" "$BUILD_NUMBER" >> "$GITHUB_ENV"
+            echo "version: ${BUILD_NAME:-pubspec} (${BUILD_NUMBER:-pubspec})"
+          fi
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true # Flutter SDK만 캐시한다(소스 없음)
+
+      - name: Build iOS (unsigned, output captured privately)
+        working-directory: ${{ env.SRC_DIR }}
+        run: |
+          set +e
+          {
+            flutter pub get &&
+            flutter build ios --release --no-codesign \
+              ${BUILD_NAME:+--build-name="$BUILD_NAME"} ${BUILD_NUMBER:+--build-number="$BUILD_NUMBER"} \
+              --dart-define=SCIN_API_URL="${SCIN_API_URL}" \
+              --dart-define=SCIN_WEB_URL="${SCIN_WEB_URL}" &&
+            mkdir -p "$RUNNER_TEMP/ipa/Payload" &&
+            cp -R build/ios/iphoneos/Runner.app "$RUNNER_TEMP/ipa/Payload/" &&
+            (cd "$RUNNER_TEMP/ipa" && zip -qry "$OUT_DIR/scin-unsigned.ipa" Payload)
+          } > "$OUT_DIR/build.log" 2>&1
+          status=$?
+          echo "build exit code: $status (details in encrypted build.log)"
+          exit $status
+
+      - name: Encrypt outputs
+        if: always()
+        env:
+          SOURCE_KEY: ${{ secrets.SOURCE_KEY }}
+        run: |
+          OPENSSL="$(brew --prefix openssl@3)/bin/openssl"
+          mkdir -p "$RUNNER_TEMP/enc"
+          tar -C "$OUT_DIR" -cz . \
+            | "$OPENSSL" enc -aes-256-cbc -salt -pbkdf2 -iter 200000 -md sha256 \
+                -pass env:SOURCE_KEY -out "$RUNNER_TEMP/enc/output.tar.gz.enc"
+          rm -rf "$SRC_DIR" "$OUT_DIR" "$RUNNER_TEMP/ipa"
+
+      - name: Upload encrypted outputs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: output
+          path: ${{ runner.temp }}/enc/output.tar.gz.enc
+          retention-days: 7
+          if-no-files-found: error
